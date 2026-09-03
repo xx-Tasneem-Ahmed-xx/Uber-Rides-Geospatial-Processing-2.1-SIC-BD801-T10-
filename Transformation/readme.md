@@ -163,3 +163,120 @@ Because of the `.limit()` dev-sampling caveat above, the day-of-week/peak-hour a
 ## 8. Handoff to Geospatial Processing
 
 - **Member 3 (dimensional modeling)**: `fact_trip_clean` carries `pu_location_id`/`do_location_id` as clean integer FKs, plus `pu_borough`/`pu_zone`/`pu_service_zone`/`do_borough`/`do_zone`/`do_service_zone` for convenience — build `Dim_Location` from the zones + `taxi_zones.parquet` geometry file (note: the geometry shapefile has 263 rows vs. 265 in the attribute zones table, worth resolving).
+
+---
+
+# Geospatial Engine & Advanced Transformations — PySpark (Part 2)
+
+## 9. Geospatial Source & Geometry Data
+
+| File | Location | Role |
+| :--- | :--- | :--- |
+| `trip_clean_data` | `hdfs:///tlc/silver/trip_clean_data` | Cleaned trip records from the previous ETL phase (499,999 rows). |
+| `taxi_zones.parquet` | `hdfs:///tlc/raw/zones/taxi_zones.parquet` | Official NYC TLC polygon shapefile for zone centroids and spatial hashing. |
+
+## 10. Geospatial Architecture & Spatial Indexing Choices
+
+The cleaned HVFHV data carries zone IDs but lacks physical coordinates. To make the data analysis-ready for spatial modeling and ML feature stores, we engineered two complementary spatial indexes:
+
+- **Coordinate System Reprojection (`EPSG:2263` → `EPSG:4326`):** The raw shapefile uses the NY State Plane projection (measured in feet). We reprojected it to WGS84 latitude/longitude degrees before computing centroids.
+- **Uber H3 Hexagonal Grid (Resolution 8):** Hexagons have 6 equidistant neighbors with zero directional distance distortion. At Resolution 8, cell radius is ~461m (~0.737 km²), matching NYC city block dimensions. Essential for Gold-layer surge pricing and demand hotspots.
+- **Geohash (Precision 6):** Rectangular bounding boxes (~1.2 km × 0.6 km) optimized for fast spatial prefix-matching and cache lookups.
+- **Precomputation Pattern:** Rather than invoking Python UDFs on 20M+ trip rows (which causes severe JVM-Python serialization bottlenecks), spatial keys were precomputed on the 263 zone polygons in memory (< 1 sec) and attached via a broadcast join.
+
+## 11. Schema — Enriched Silver (`staging_rides_geo`)
+
+This is the final schema produced by the geospatial enrichment pipeline, saved in Parquet format partitioned by `year`/`month`/`day`:
+
+```
+root
+ |-- trip_id: string (nullable = false)                    -- NEW: Synthetic primary key
+ |-- pu_location_id: integer (nullable = true)
+ |-- do_location_id: integer (nullable = true)
+ |-- license_num: string (nullable = true)
+ |-- dispatching_base_num: string (nullable = true)
+ |-- originating_base_num: string (nullable = false)
+ |-- request_datetime: timestamp (nullable = true)
+ |-- on_scene_datetime: timestamp (nullable = true)
+ |-- pickup_datetime: timestamp (nullable = true)
+ |-- dropoff_datetime: timestamp (nullable = true)
+ |-- trip_miles: double (nullable = true)
+ |-- trip_time: long (nullable = true)
+ |-- trip_duration_sec: long (nullable = true)
+ |-- avg_speed_mph: double (nullable = false)              -- NEW: Calculated velocity
+ |-- is_speed_anomaly: boolean (nullable = false)          -- NEW: Flag for speed > 120 mph
+ |-- base_passenger_fare: double (nullable = false)
+ |-- tolls: double (nullable = false)
+ |-- bcf: double (nullable = false)
+ |-- sales_tax: double (nullable = false)
+ |-- congestion_surcharge: double (nullable = false)
+ |-- airport_fee: double (nullable = false)
+ |-- tips: double (nullable = false)
+ |-- driver_pay: double (nullable = false)
+ |-- total_fare: double (nullable = false)
+ |-- shared_request_flag: boolean (nullable = true)
+ |-- shared_match_flag: boolean (nullable = true)
+ |-- access_a_ride_flag: boolean (nullable = true)
+ |-- wav_request_flag: boolean (nullable = true)
+ |-- wav_match_flag: boolean (nullable = true)
+ |-- was_on_scene_matched: boolean (nullable = false)
+ |-- pu_borough: string (nullable = true)
+ |-- pu_zone: string (nullable = true)
+ |-- pu_service_zone: string (nullable = true)
+ |-- do_borough: string (nullable = true)
+ |-- do_zone: string (nullable = true)
+ |-- do_service_zone: string (nullable = true)
+ |-- pu_lat: double (nullable = true)                      -- NEW: Pickup centroid latitude (WGS84)
+ |-- pu_lon: double (nullable = true)                      -- NEW: Pickup centroid longitude (WGS84)
+ |-- start_geo_hash: string (nullable = true)              -- NEW: Pickup Geohash (Precision 6)
+ |-- pu_h3_res8: string (nullable = true)                  -- NEW: Pickup Uber H3 (Resolution 8)
+ |-- do_lat: double (nullable = true)                      -- NEW: Dropoff centroid latitude (WGS84)
+ |-- do_lon: double (nullable = true)                      -- NEW: Dropoff centroid longitude (WGS84)
+ |-- end_geo_hash: string (nullable = true)                -- NEW: Dropoff Geohash (Precision 6)
+ |-- do_h3_res8: string (nullable = true)                  -- NEW: Dropoff Uber H3 (Resolution 8)
+ |-- is_weekend: boolean (nullable = true)
+ |-- is_peak_hour: boolean (nullable = true)
+ |-- year: integer (nullable = true)                       -- Partition key
+ |-- month: integer (nullable = true)                      -- Partition key
+ |-- day: integer (nullable = true)                        -- Partition key
+```
+
+Output is written to `hdfs:///tlc/silver/staging_rides_geo`, partitioned by `year`/`month`/`day`.
+
+## 12. Geospatial Transformation Steps & Rationale
+
+| Step | What | Why |
+| :--- | :--- | :--- |
+| 1. Read Geometry & Reproject | Read `taxi_zones.parquet` via Spark, parse WKB/WKT, reproject `EPSG:2263` → `EPSG:4326` | Resolves the absence of raw coordinates and aligns with WGS84 standards |
+| 2. Centroid Extraction | Calculate `centroid.x` (lon) and `centroid.y` (lat) for all 263 zone polygons | Derives representative point coordinates for each taxi zone |
+| 3. Precompute Spatial Keys | Encode centroids into Uber H3 (Res 8) and Geohash (Precision 6) | Generates standardized spatial indexing keys for both pickup and dropoff |
+| 4. Broadcast Join (Zero Shuffle) | `F.broadcast()` spatial lookup table joined on `pu_location_id` and `do_location_id` | Prevents shuffling millions of trip rows across executors, speeding up the pipeline |
+| 5. Primary Key Generation | Synthesize `trip_id` using `license_num` + locations + timestamp + `monotonically_increasing_id` | Establishes a deterministic join key for downstream payments and driver tables |
+| 6. Velocity & Anomaly Checks | Calculate `avg_speed_mph`; flag speeds > 120 mph with `is_speed_anomaly` | Detects GPS/meter anomalies while preserving data lineage for downstream modeling |
+| 7. Partitioned Write | `repartition(4, "year", "month", "day")` before writing Parquet | Controls HDFS block distribution (~128MB) and enables query partition pruning |
+
+## 13. Latest Run Results (Verification Run, 499,999 rows)
+
+| Metric | Value |
+| :--- | :--- |
+| Input clean rows | 499,999 |
+| Output staging rows | 499,999 (0 rows dropped during join) |
+| `trip_id` nulls | 0 (0.00%) |
+| `start_geo_hash` / `pu_h3` nulls | 21 (0.00%) — exactly matches N/A zone IDs (264/265) identified in EDA |
+| `end_geo_hash` / `do_h3` nulls | 18,801 (3.76%) — trips terminating outside NYC borders (Zone 265) |
+| `avg_speed_mph` nulls | 0 (0.00%) |
+| Average speed range observed | 5.44 – 11.86 mph (consistent with typical NYC urban traffic density) |
+
+## 14. Advanced Spark Concepts — Where They Show Up
+
+- **Broadcast Joins (`F.broadcast`)**: Applied twice (for pickup and dropoff spatial keys). By broadcasting the compact 263-row spatial table to all executors, we eliminated cluster-wide network shuffles.
+- **Precomputation over Row-Level UDFs**: Replaced costly PySpark UDF execution on 20M rows with vectorized precomputation on reference zones.
+- **Adaptive Query Execution (AQE)**: Configured `spark.sql.adaptive.enabled=true` and `coalescePartitions.enabled=true` for dynamic shuffle partition coalescing.
+- **Partition Pruning**: Enforced `partitionBy("year", "month", "day")` on write so downstream Gold queries can prune unneeded daily partitions.
+
+## 15. Handoff to Dimensional Modeling (Gold Layer)
+
+`staging_rides_geo` is the authoritative consolidated Silver table ready for Star Schema modeling:
+- **`Fact_Trip`**: Uses `trip_id` as primary key, `pu_h3_res8` / `do_h3_res8` for spatial facts, and `avg_speed_mph` for performance metrics.
+- **`Dim_Location`**: Can be derived directly from distinct `(pu_location_id, pu_borough, pu_zone, pu_lat, pu_lon, start_geo_hash, pu_h3_res8)`.
+- **Downstream Integration**: Downstream tables (Drivers, Payments, and Customer Support) join directly to this table via `trip_id` and `license_num`.
