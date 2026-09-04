@@ -1,0 +1,79 @@
+
+USE uber_dw;
+
+SELECT 
+    d.day_of_week,
+    COUNT(f.trip_miles) AS total_trips,
+    ROUND(SUM(f.total_fare), 2) AS total_revenue,
+    ROUND(AVG(f.total_fare), 2) AS avg_fare_per_trip
+FROM fact_trips f
+JOIN dim_datetime d ON f.pickup_datetime_key = d.datetime_key
+GROUP BY d.day_of_week
+ORDER BY total_revenue DESC;
+
+
+
+SELECT 
+    l.borough,
+    l.zone,
+    COUNT(f.trip_miles) AS total_trips,
+    ROUND(SUM(f.total_fare), 2) AS total_revenue
+FROM fact_trips f
+JOIN dim_location l ON f.pickup_location_id = l.location_id
+GROUP BY l.borough, l.zone
+ORDER BY total_trips DESC
+LIMIT 10;
+
+
+
+SELECT 
+    t.shared_request_flag,
+    COUNT(f.trip_miles) AS total_trips,
+    ROUND(AVG(f.trip_miles), 2) AS avg_distance,
+    ROUND(AVG(f.total_fare), 2) AS avg_fare
+FROM fact_trips f
+JOIN dim_trip_flags t ON f.flag_key = t.flag_key
+GROUP BY t.shared_request_flag;
+
+
+
+
+
+SELECT 
+    d.hour,
+    d.is_peak_hour,
+    COUNT(f.trip_miles) AS total_trips,
+    ROUND(SUM(f.total_fare), 2) AS total_revenue
+FROM fact_trips f
+JOIN dim_datetime d ON f.pickup_datetime_key = d.datetime_key
+GROUP BY d.hour, d.is_peak_hour
+ORDER BY total_trips DESC
+LIMIT 10
+
+
+
+
+
+SELECT 
+    COUNT(f.trip_miles) AS total_trips,
+    ROUND(AVG(f.congestion_surcharge), 2) AS avg_congestion_fee,
+    ROUND(AVG(f.tolls), 2) AS avg_tolls,
+    ROUND(AVG(f.total_fare), 2) AS avg_total_fare
+FROM fact_trips f;
+
+
+SELECT 
+    year,
+    COUNT(DISTINCT month) AS total_months_in_year,
+    COUNT(*) AS total_records_in_year
+FROM dim_datetime
+GROUP BY year
+ORDER BY year ASC;
+
+
+
+
+
+
+
+
